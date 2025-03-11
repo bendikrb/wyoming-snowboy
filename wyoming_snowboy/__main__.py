@@ -4,10 +4,10 @@ import asyncio
 import itertools
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Dict, Final, Optional
+from typing import Dict, Final, List, Optional, Set
 
 from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStart, AudioStop
 from wyoming.event import Event
@@ -55,14 +55,35 @@ class Keyword:
     settings: KeywordSettings
 
 
+@dataclass
+class KeywordDetector:
+    """Keyword detector with state"""
+
+    name: str
+    detector: snowboydetect.SnowboyDetect
+    is_detected: bool = False
+
+
+@dataclass
+class ClientData:
+    """Data for a connected client"""
+
+    active_keywords: Optional[Set[str]] = field(default_factory=set)
+    detectors: Optional[Dict[str, KeywordDetector]] = field(default_factory=dict)
+    audio_buffer: Optional[bytes] = None
+
+
 class State:
     """State of system"""
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.available_keywords: Dict[str, Keyword] = {}
+        self.clients: Dict[str, ClientData] = {}
+        self._load_available_keywords()
 
-    def get_detector(self, keyword_name: str) -> snowboydetect.SnowboyDetect:
-        keyword: Optional[Keyword] = None
+    def _load_available_keywords(self):
+        """Load all available keywords from data and custom directories"""
         for kw_dir in self.args.custom_model_dir + [self.args.data_dir]:
             if not kw_dir.is_dir():
                 continue
@@ -71,16 +92,22 @@ class State:
                 kw_dir.glob("*.umdl"), kw_dir.glob("*.pmdl")
             ):
                 kw_name = kw_path.stem
-                if kw_name == keyword_name:
-                    keyword = Keyword(
+                if kw_name not in self.available_keywords:
+                    self.available_keywords[kw_name] = Keyword(
                         name=kw_name,
                         model_path=kw_path,
                         settings=DEFAULT_SETTINGS.get(kw_name, KeywordSettings()),
                     )
-                    break
+        _LOGGER.debug(
+            f"Loaded {len(self.available_keywords)} available keywords: {', '.join(self.available_keywords.keys())}"
+        )
 
-        if keyword is None:
+    def create_detector(self, keyword_name: str) -> KeywordDetector:
+        """Create a detector for a specific keyword"""
+        if keyword_name not in self.available_keywords:
             raise ValueError(f"No keyword {keyword_name}")
+
+        keyword = self.available_keywords[keyword_name]
 
         sensitivity = self.args.sensitivity
         if keyword.settings.sensitivity is not None:
@@ -115,7 +142,7 @@ class State:
         detector.SetAudioGain(audio_gain)
         detector.ApplyFrontend(apply_frontend)
 
-        return detector
+        return KeywordDetector(name=keyword_name, detector=detector)
 
 
 async def main() -> None:
@@ -208,100 +235,169 @@ class SnowboyEventHandler(AsyncEventHandler):
         self.client_id = str(time.monotonic_ns())
         self.state = state
         self.converter = AudioChunkConverter(rate=16000, width=2, channels=1)
-        self.detected = False
-        self.audio_buffer = bytes()
-
-        self.detector: Optional[snowboydetect.SnowboyDetect] = None
-        self.keyword_name: str = ""
+        self.client_data = ClientData()
 
         _LOGGER.debug("Client connected: %s", self.client_id)
+        self.state.clients[self.client_id] = self.client_data
 
     async def handle_event(self, event: Event) -> bool:
-        if Describe.is_type(event.type):
-            wyoming_info = self._get_info()
-            await self.write_event(wyoming_info.event())
-            _LOGGER.debug("Sent info to client: %s", self.client_id)
-            return True
+        try:
+            if Describe.is_type(event.type):
+                wyoming_info = self._get_info()
+                await self.write_event(wyoming_info.event())
+                _LOGGER.debug("Sent info to client: %s", self.client_id)
+                return True
 
-        if Detect.is_type(event.type):
-            detect = Detect.from_event(event)
-            if detect.names:
-                # TODO: use all names
-                self._load_keyword(detect.names[0])
-        elif AudioStart.is_type(event.type):
-            self.detected = False
-        elif AudioChunk.is_type(event.type):
-            if self.detector is None:
-                # Default keyword
-                self._load_keyword(DEFAULT_KEYWORD)
+            if Detect.is_type(event.type):
+                detect = Detect.from_event(event)
+                if detect.names:
+                    # Load specific requested keywords
+                    self._ensure_keywords_loaded(detect.names)
+                    self.client_data.active_keywords = set(detect.names)
+                else:
+                    # If no specific keywords requested, load and activate all available ones
+                    self._load_all_keywords()
+            elif AudioStart.is_type(event.type):
+                # Reset detection state for all detectors
+                for detector in self.client_data.detectors.values():
+                    detector.is_detected = False
 
-            assert self.detector is not None
+                # Clear audio buffer
+                self.client_data.audio_buffer = bytes()
 
-            chunk = AudioChunk.from_event(event)
-            chunk = self.converter.convert(chunk)
-            self.audio_buffer += chunk.audio
+                # If no keywords are loaded yet, load all available ones
+                if not self.client_data.detectors:
+                    self._load_all_keywords()
 
-            while len(self.audio_buffer) >= BYTES_PER_CHUNK:
-                # Return is:
-                # -2 silence
-                # -1 error
-                #  0 voice
-                #  n index n-1
-                result_index = self.detector.RunDetection(
-                    self.audio_buffer[:BYTES_PER_CHUNK]
-                )
-                if result_index > 0:
-                    _LOGGER.debug(
-                        "Detected %s from client %s", self.keyword_name, self.client_id
-                    )
-                    await self.write_event(
-                        Detection(
-                            name=self.keyword_name, timestamp=chunk.timestamp
-                        ).event()
-                    )
+                _LOGGER.debug("Receiving audio from client: %s", self.client_id)
 
-                self.audio_buffer = self.audio_buffer[BYTES_PER_CHUNK:]
+            elif AudioChunk.is_type(event.type):
+                # If no keywords are loaded yet, load all available ones
+                if not self.client_data.detectors:
+                    self._load_all_keywords()
 
-        elif AudioStop.is_type(event.type):
-            # Inform client if not detections occurred
-            if not self.detected:
-                # No wake word detections
-                await self.write_event(NotDetected().event())
+                chunk = AudioChunk.from_event(event)
+                chunk = self.converter.convert(chunk)
+                self.client_data.audio_buffer += chunk.audio
 
+                # Flag to track if we've sent a detection in this chunk processing
+                detection_sent = False
+
+                while len(self.client_data.audio_buffer) >= BYTES_PER_CHUNK:
+                    chunk_data = self.client_data.audio_buffer[:BYTES_PER_CHUNK]
+
+                    # Process audio through all active detectors
+                    for keyword_name in list(self.client_data.active_keywords):
+                        if keyword_name not in self.client_data.detectors:
+                            continue
+
+                        detector = self.client_data.detectors[keyword_name]
+                        if detector.is_detected:
+                            continue
+
+                        # Return is:
+                        # -2 silence
+                        # -1 error
+                        #  0 voice
+                        #  n index n-1
+                        result_index = detector.detector.RunDetection(chunk_data)
+                        if result_index > 0:
+                            _LOGGER.debug(
+                                "Detected %s from client %s",
+                                keyword_name,
+                                self.client_id,
+                            )
+                            detector.is_detected = True
+
+                            # Only send one detection per chunk processing to avoid overwhelming the client
+                            if not detection_sent:
+                                try:
+                                    await self.write_event(
+                                        Detection(
+                                            name=keyword_name, timestamp=chunk.timestamp
+                                        ).event()
+                                    )
+                                    detection_sent = True
+
+                                    # After sending a detection, we can return to let the client process it
+                                    # This helps prevent connection reset errors
+                                    self.client_data.audio_buffer = (
+                                        self.client_data.audio_buffer[BYTES_PER_CHUNK:]
+                                    )
+                                    return True
+                                except (ConnectionResetError, BrokenPipeError) as e:
+                                    _LOGGER.warning(
+                                        f"Connection error while sending detection: {e}"
+                                    )
+                                    return False
+
+                    self.client_data.audio_buffer = self.client_data.audio_buffer[
+                        BYTES_PER_CHUNK:
+                    ]
+
+            elif AudioStop.is_type(event.type):
+                # Inform client if no detections occurred
+                if not any(
+                    detector.is_detected
+                    for detector in self.client_data.detectors.values()
+                ):
+                    # No wake word detections
+                    try:
+                        await self.write_event(NotDetected().event())
+                        _LOGGER.debug(
+                            "Audio stopped without detection from client: %s",
+                            self.client_id,
+                        )
+                    except (ConnectionResetError, BrokenPipeError) as e:
+                        _LOGGER.warning(
+                            f"Connection error while sending NotDetected: {e}"
+                        )
+                        return False
+                return False
+            else:
                 _LOGGER.debug(
-                    "Audio stopped without detection from client: %s", self.client_id
+                    "Unexpected event: type=%s, data=%s", event.type, event.data
                 )
-
+            return True
+        except (ConnectionResetError, BrokenPipeError) as e:
+            _LOGGER.warning(f"Connection error in handle_event: {e}")
             return False
-        else:
-            _LOGGER.debug("Unexpected event: type=%s, data=%s", event.type, event.data)
-
-        return True
+        except Exception as e:
+            _LOGGER.exception(f"Unexpected error in handle_event: {e}")
+            return False
 
     async def disconnect(self) -> None:
         _LOGGER.debug("Client disconnected: %s", self.client_id)
+        # Remove client data
+        if self.client_id in self.state.clients:
+            del self.state.clients[self.client_id]
 
-    def _load_keyword(self, keyword_name: str):
-        self.detector = self.state.get_detector(keyword_name)
-        self.keyword_name = keyword_name
+    def _ensure_keywords_loaded(self, keyword_names: List[str]):
+        """Ensure specific keywords are loaded"""
+        for keyword_name in keyword_names:
+            if keyword_name not in self.client_data.detectors:
+                try:
+                    self.client_data.detectors[
+                        keyword_name
+                    ] = self.state.create_detector(keyword_name)
+                    _LOGGER.debug(f"Loaded keyword detector for {keyword_name}")
+                except ValueError as e:
+                    _LOGGER.warning(f"Failed to load keyword {keyword_name}: {e}")
+
+        if not self.client_data.active_keywords:
+            # If no active keywords yet, activate all loaded ones
+            self.client_data.active_keywords = set(self.client_data.detectors.keys())
+
+        _LOGGER.debug(
+            f"Active keywords for client {self.client_id}: {', '.join(self.client_data.active_keywords)}"
+        )
+
+    def _load_all_keywords(self):
+        """Load all available keywords"""
+        all_keywords = list(self.state.available_keywords.keys())
+        self._ensure_keywords_loaded(all_keywords)
 
     def _get_info(self) -> Info:
-        # name -> keyword
-        keywords: Dict[str, Keyword] = {}
-        for kw_dir in [self.cli_args.data_dir] + self.cli_args.custom_model_dir:
-            if not kw_dir.is_dir():
-                continue
-
-            for kw_path in itertools.chain(
-                kw_dir.glob("*.umdl"), kw_dir.glob("*.pmdl")
-            ):
-                kw_name = kw_path.stem
-                keywords[kw_name] = Keyword(
-                    name=kw_name,
-                    model_path=kw_path,
-                    settings=DEFAULT_SETTINGS.get(kw_name, KeywordSettings()),
-                )
-
         return Info(
             wake=[
                 WakeProgram(
@@ -325,7 +421,7 @@ class SnowboyEventHandler(AsyncEventHandler):
                             languages=[],
                             version="1.3.0",
                         )
-                        for kw in keywords.values()
+                        for kw in self.state.available_keywords.values()
                     ],
                 )
             ],
